@@ -9,6 +9,7 @@ pub mod installer;
 pub mod ipc;
 pub mod local;
 pub mod module;
+pub mod range_cache;
 pub mod thirdparty;
 pub mod utils;
 use clap::Parser;

@@ -76,7 +76,7 @@ export interface MergedGroupInfo {
   totalDownloadSize: number;
   totalEffectiveSize: number;
   wasteRatio: number;
-  gaps: Array<{start: number, end: number}>;
+  gaps: Array<{ start: number; end: number }>;
 }
 
 export interface VirtualMergedFile extends DfsUpdateTask {
@@ -162,6 +162,7 @@ export interface InsightItem {
   error?: string;
   range?: [number, number][]; // HTTP Range请求范围
   mode?: string; // 安装模式
+  transport?: string;
 }
 
 export interface InstallResult {

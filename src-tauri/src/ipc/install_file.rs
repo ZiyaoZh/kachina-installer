@@ -533,6 +533,7 @@ pub async fn ipc_install_multipart_stream(
                 error: Some("Failed to get insight".to_string()),
                 range: vec![],
                 mode: None,
+                transport: None,
             }
         };
 
@@ -596,6 +597,7 @@ pub async fn ipc_install_multipart_stream(
                         error: Some("Failed to get insight".to_string()),
                         range: vec![],
                         mode: None,
+                        transport: None,
                     }
                 };
 
@@ -793,6 +795,7 @@ pub async fn ipc_install_multichunk_stream(
             error: Some("Failed to get insight".to_string()),
             range: vec![],
             mode: None,
+            transport: None,
         }
     };
 

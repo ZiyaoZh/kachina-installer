@@ -22,6 +22,7 @@ use crate::{
     dfs::InsightItem,
     installer::uninstall::DELETE_SELF_ON_EXIT_PATH,
     local::mmap,
+    range_cache,
     utils::{
         error::{TAResult, DOWNLOAD_STALLED, DOWNLOAD_TOO_SLOW},
         hash::run_hash,
@@ -370,6 +371,7 @@ impl<S> NetworkInsightStream<S> {
             error: None,
             range: range.clone(),
             mode: None,
+            transport: None,
         }));
 
         Self {
@@ -474,6 +476,7 @@ impl<S> NetworkInsightStream<S> {
                 error: Some("Failed to lock insight".to_string()),
                 range: vec![],
                 mode: None,
+                transport: None,
             }
         }
     }
@@ -631,11 +634,42 @@ pub async fn create_http_stream(
 > {
     let request_start_time = Instant::now();
     let has_range = size > 0;
+    let range_info = if has_range {
+        vec![(offset as u32, (offset + size - 1) as u32)]
+    } else {
+        vec![]
+    };
+
+    if has_range {
+        if let Some(cached) = range_cache::open_cached_range_if_available(url, offset, size).await?
+        {
+            let insight = Arc::new(Mutex::new(InsightItem {
+                url: crate::utils::url::sanitize_url_for_logging(url),
+                ttfb: 0,
+                time: 0,
+                size: 0,
+                error: None,
+                range: range_info.clone(),
+                mode: None,
+                transport: Some(cached.source.transport_label().to_string()),
+            }));
+
+            if skip_decompress {
+                return Ok((cached.reader, size as u64, insight));
+            }
+
+            let buf_reader = BufReader::new(cached.reader);
+            let decompressed = TokioZstdDecoder::new(buf_reader);
+            return Ok((Box::new(decompressed), size as u64, insight));
+        }
+    }
 
     // 构建HTTP请求
     let mut builder = DOWNLOAD_CLIENT.get(url);
     if has_range {
-        builder = builder.header("Range", format!("bytes={}-{}", offset, offset + size - 1));
+        builder = builder
+            .header("Range", format!("bytes={}-{}", offset, offset + size - 1))
+            .header("Accept-Encoding", "identity");
     }
 
     // 发送请求
@@ -655,12 +689,9 @@ pub async fn create_http_stream(
                 time: 0,
                 size: 0,
                 error: Some(format!("{:#}", e)),
-                range: if has_range {
-                    vec![(offset as u32, (offset + size - 1) as u32)]
-                } else {
-                    vec![]
-                },
+                range: range_info.clone(),
                 mode: None,
+                transport: None,
             }));
             return Err(crate::utils::error::TACommandError::with_insight_handle(e, insight).error);
         }
@@ -668,6 +699,58 @@ pub async fn create_http_stream(
 
     // HTTP状态码检查
     let code = res.status();
+    if has_range && code.as_u16() == 200 {
+        let cached = match range_cache::open_range_from_200_response(url, res, offset, size).await {
+            Ok(cached) => cached,
+            Err(e) => {
+                let insight = Arc::new(Mutex::new(InsightItem {
+                    url: crate::utils::url::sanitize_url_for_logging(url),
+                    ttfb: request_start_time.elapsed().as_millis() as u32,
+                    time: response_received_time.elapsed().as_millis() as u32,
+                    size: 0,
+                    error: Some(format!("{:#}", e)),
+                    range: range_info.clone(),
+                    mode: None,
+                    transport: Some("range-cache-full-200-error".to_string()),
+                }));
+                let error = e.context(crate::utils::url::create_reqwest_context(
+                    "create_http_stream",
+                    url,
+                    "HTTP_RANGE_CACHE_ERR",
+                ));
+                return Err(crate::utils::error::TACommandError::with_insight_handle(
+                    error, insight,
+                )
+                .error);
+            }
+        };
+
+        tracing::info!(
+            "Using full-body range cache fallback for {} {}-{}",
+            crate::utils::url::sanitize_url_for_logging(url),
+            offset,
+            offset + size - 1
+        );
+
+        let insight = Arc::new(Mutex::new(InsightItem {
+            url: crate::utils::url::sanitize_url_for_logging(url),
+            ttfb: request_start_time.elapsed().as_millis() as u32,
+            time: response_received_time.elapsed().as_millis() as u32,
+            size: cached.total_size.min(u32::MAX as u64) as u32,
+            error: None,
+            range: range_info.clone(),
+            mode: None,
+            transport: Some(cached.source.transport_label().to_string()),
+        }));
+
+        if skip_decompress {
+            return Ok((cached.reader, size as u64, insight));
+        }
+
+        let buf_reader = BufReader::new(cached.reader);
+        let decompressed = TokioZstdDecoder::new(buf_reader);
+        return Ok((Box::new(decompressed), size as u64, insight));
+    }
     if (!has_range && code != 200) || (has_range && code != 206) {
         let insight = Arc::new(Mutex::new(InsightItem {
             url: crate::utils::url::sanitize_url_for_logging(url),
@@ -675,12 +758,9 @@ pub async fn create_http_stream(
             time: 0,
             size: 0,
             error: Some(format!("HTTP status error: {}", code)),
-            range: if has_range {
-                vec![(offset as u32, (offset + size - 1) as u32)]
-            } else {
-                vec![]
-            },
+            range: range_info.clone(),
             mode: None,
+            transport: None,
         }));
         let error = anyhow::Error::new(std::io::Error::other(format!(
             "URL {} returned {}",
@@ -703,11 +783,7 @@ pub async fn create_http_stream(
     let insight_stream = NetworkInsightStream::new_with_detection(
         reader,
         crate::utils::url::sanitize_url_for_logging(url),
-        if has_range {
-            vec![(offset as u32, (offset + size - 1) as u32)]
-        } else {
-            vec![]
-        },
+        range_info,
         request_start_time,
         response_received_time,
         Some(content_length),
@@ -753,6 +829,7 @@ pub async fn create_multi_http_stream(
     let res = DOWNLOAD_CLIENT
         .get(url)
         .header("Range", format!("bytes={range}"))
+        .header("Accept-Encoding", "identity")
         .send()
         .await
         .with_http_context("create_multi_http_stream", url);
@@ -767,8 +844,9 @@ pub async fn create_multi_http_stream(
                 time: 0,
                 size: 0,
                 error: Some(format!("{:#}", e)),
-                range: range_info,
+                range: range_info.clone(),
                 mode: None,
+                transport: None,
             }));
             return Err(crate::utils::error::TACommandError::with_insight_handle(
                 e, insight,
@@ -779,25 +857,47 @@ pub async fn create_multi_http_stream(
     // HTTP状态码检查
     let code = res.status();
     if code != 206 {
+        let unsupported_multipart = matches!(code.as_u16(), 200 | 501);
+        let error_message = if unsupported_multipart {
+            format!(
+                "{}: URL {} returned {} for multi-range request",
+                range_cache::ERR_MULTIPART_RANGE_UNSUPPORTED,
+                crate::utils::url::sanitize_url_for_logging(url),
+                code
+            )
+        } else {
+            format!(
+                "URL {} returned {}",
+                crate::utils::url::sanitize_url_for_logging(url),
+                code
+            )
+        };
+        let error_context = if unsupported_multipart {
+            range_cache::ERR_MULTIPART_RANGE_UNSUPPORTED
+        } else {
+            "HTTP_STATUS_ERR"
+        };
         let insight = Arc::new(Mutex::new(InsightItem {
             url: crate::utils::url::sanitize_url_for_logging(url),
             ttfb: request_start_time.elapsed().as_millis() as u32,
             time: 0,
             size: 0,
-            error: Some(format!("HTTP status error: {}", code)),
-            range: range_info,
+            error: Some(if unsupported_multipart {
+                range_cache::ERR_MULTIPART_RANGE_UNSUPPORTED.to_string()
+            } else {
+                format!("HTTP status error: {}", code)
+            }),
+            range: range_info.clone(),
             mode: None,
+            transport: None,
         }));
-        let error = anyhow::Error::new(std::io::Error::other(format!(
-            "URL {} returned {}",
-            crate::utils::url::sanitize_url_for_logging(url),
-            code
-        )))
-        .context(crate::utils::url::create_reqwest_context(
-            "create_multi_http_stream",
-            url,
-            "HTTP_STATUS_ERR",
-        ));
+        let error = anyhow::Error::new(std::io::Error::other(error_message)).context(
+            crate::utils::url::create_reqwest_context(
+                "create_multi_http_stream",
+                url,
+                error_context,
+            ),
+        );
         return Err(crate::utils::error::TACommandError::with_insight_handle(
             error, insight,
         ));

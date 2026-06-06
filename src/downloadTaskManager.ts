@@ -14,6 +14,15 @@ import {
 import { log, error } from './api/ipc';
 import { friendlyError } from './utils/friendlyError';
 
+const ERR_MULTIPART_RANGE_UNSUPPORTED = 'ERR_MULTIPART_RANGE_UNSUPPORTED';
+
+const isMultipartRangeUnsupported = (err: unknown): boolean => {
+  if (err instanceof TAError || err instanceof Error) {
+    return err.message.includes(ERR_MULTIPART_RANGE_UNSUPPORTED);
+  }
+  return JSON.stringify(err).includes(ERR_MULTIPART_RANGE_UNSUPPORTED);
+};
+
 // 格式化文件大小
 const formatFileSize = (size: number): string => {
   if (size >= 1024 * 1024) {
@@ -259,7 +268,7 @@ export class MergedGroupTask implements DownloadTask {
       this.logMergedResults(false, JSON.stringify(err));
 
       // 如果还没重试过，重试一次合并下载
-      if (!this.hasRetriedMerged) {
+      if (!isMultipartRangeUnsupported(err) && !this.hasRetriedMerged) {
         this.hasRetriedMerged = true;
         return this.execute(); // 递归重试
       }

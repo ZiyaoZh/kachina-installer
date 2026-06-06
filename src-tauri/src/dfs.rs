@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::{
+    range_cache,
     utils::{error::TAResult, url::HttpContextExt},
     REQUEST_CLIENT,
 };
@@ -110,6 +111,8 @@ pub struct InsightItem {
     pub range: Vec<(u32, u32)>, // HTTP Range请求范围
     #[serde(default)]
     pub mode: Option<String>, // 安装模式
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -478,15 +481,35 @@ pub async fn solve_dfs2_challenge(challenge_type: String, data: String) -> Resul
 
 #[tauri::command]
 pub async fn get_http_with_range(url: String, offset: u64, size: u64) -> TAResult<(u16, Vec<u8>)> {
+    let has_range = size > 0;
+    if has_range {
+        if let Some(bytes) =
+            range_cache::read_cached_range_if_available(&url, offset as usize, size as usize)
+                .await?
+        {
+            return Ok((206, bytes));
+        }
+    }
+
     let mut res = REQUEST_CLIENT.get(&url);
-    if offset != 0 || size != 0 {
-        res = res.header("Range", format!("bytes={}-{}", offset, offset + size - 1));
+    if has_range {
+        res = res
+            .header("Range", format!("bytes={}-{}", offset, offset + size - 1))
+            .header("Accept-Encoding", "identity");
     }
     let res = res
         .send()
         .await
         .with_http_context("get_http_with_range", &url)?;
     let status = res.status();
+
+    if has_range && status.as_u16() == 200 {
+        let bytes =
+            range_cache::read_range_from_200_response(&url, res, offset as usize, size as usize)
+                .await?;
+        return Ok((206, bytes));
+    }
+
     let bytes = res
         .bytes()
         .await
